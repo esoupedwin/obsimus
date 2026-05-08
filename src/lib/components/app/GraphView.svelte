@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { vault, tabs, ui } from '$lib/state.svelte';
+  import { vault, tabs, ui, dragNote } from '$lib/state.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { onMount, onDestroy } from 'svelte';
@@ -24,7 +24,12 @@
   let panY = $state(0);
 
   let filter = $state('');
-  let showOrphans = $state(true);
+  let hideNeighbors = $state(false);
+
+  // Local-graph mode: nothing visible until the user drags notes onto the canvas.
+  let visibleIds = $state(new Set<string>());
+  // Spawn coords for newly-added nodes so they appear at the drop point.
+  let seedPositions = new Map<string, { x: number; y: number }>();
 
   // Visual / simulation tuning, controlled by the bottom edit bar.
   let spreadMul = $state(1);   // 0.4 .. 5    — node spacing
@@ -43,9 +48,26 @@
 
   function buildGraph() {
     const f = filter.trim().toLowerCase();
-    const allNotes = [...vault.notes.values()];
-    const filtered = allNotes.filter((n) => !f || n.name.toLowerCase().includes(f));
+    const allNotes = vault.notes;
+
+    // Visible set = explicitly-added notes + (optionally) their direct neighbors.
+    const visible = new Set<string>();
+    for (const id of visibleIds) {
+      if (!allNotes.has(id)) continue;
+      visible.add(id);
+      if (!hideNeighbors) {
+        const note = allNotes.get(id)!;
+        for (const t of note.links) if (allNotes.has(t)) visible.add(t);
+        const inc = vault.backlinks.get(id) ?? [];
+        for (const src of inc) visible.add(src);
+      }
+    }
+
+    const filtered = [...visible]
+      .map((id) => allNotes.get(id)!)
+      .filter((n) => n && (!f || n.name.toLowerCase().includes(f)));
     const filteredIds = new Set(filtered.map((n) => n.id));
+
     const newEdges: Edge[] = [];
     for (const n of filtered) {
       for (const t of n.links) {
@@ -57,26 +79,60 @@
       degree.set(e.source, (degree.get(e.source) ?? 0) + 1);
       degree.set(e.target, (degree.get(e.target) ?? 0) + 1);
     }
-    const filteredNodes = filtered
-      .filter((n) => showOrphans || (degree.get(n.id) ?? 0) > 0)
-      .map<Node>((n) => {
-        const old = nodeIdx.get(n.id);
-        return old
-          ? { ...old, label: n.name, degree: degree.get(n.id) ?? 0 }
-          : {
-              id: n.id,
-              label: n.name,
-              x: (Math.random() - 0.5) * 400,
-              y: (Math.random() - 0.5) * 400,
-              vx: 0,
-              vy: 0,
-              degree: degree.get(n.id) ?? 0
-            };
-      });
+    const filteredNodes = filtered.map<Node>((n) => {
+      const old = nodeIdx.get(n.id);
+      if (old) {
+        return { ...old, label: n.name, degree: degree.get(n.id) ?? 0 };
+      }
+      const seed = seedPositions.get(n.id);
+      return {
+        id: n.id,
+        label: n.name,
+        x: seed?.x ?? (Math.random() - 0.5) * 200,
+        y: seed?.y ?? (Math.random() - 0.5) * 200,
+        vx: 0,
+        vy: 0,
+        degree: degree.get(n.id) ?? 0
+      };
+    });
+    // Seed positions are one-shot — clear them once consumed.
+    for (const n of filteredNodes) seedPositions.delete(n.id);
+
     nodes = filteredNodes;
     edges = newEdges;
     nodeIdx = new Map(nodes.map((n) => [n.id, n]));
     reheat();
+  }
+
+  /** Add a note + its direct neighbors to the graph at a screen-space drop point. */
+  function addToGraph(noteId: string, screenX: number, screenY: number) {
+    if (!vault.notes.has(noteId)) return;
+    const w = screenToWorld(screenX, screenY);
+    if (!visibleIds.has(noteId)) seedPositions.set(noteId, { x: w.x, y: w.y });
+
+    // Seed positions for neighbors that aren't already laid out — fan around the drop point.
+    const note = vault.notes.get(noteId)!;
+    const inc = vault.backlinks.get(noteId) ?? [];
+    const fresh = [
+      ...note.links.filter((id) => vault.notes.has(id) && !nodeIdx.has(id)),
+      ...inc.filter((id) => !nodeIdx.has(id) && !note.links.includes(id))
+    ];
+    fresh.forEach((id, i) => {
+      if (seedPositions.has(id)) return;
+      const angle = (i / Math.max(1, fresh.length)) * Math.PI * 2;
+      const r = 110;
+      seedPositions.set(id, { x: w.x + Math.cos(angle) * r, y: w.y + Math.sin(angle) * r });
+    });
+
+    visibleIds.add(noteId);
+    visibleIds = new Set(visibleIds);
+    reheat();
+  }
+
+  function clearGraph() {
+    visibleIds = new Set();
+    nodeIdx = new Map();
+    seedPositions.clear();
   }
 
   // d3-force-style cooling: alpha decays from 1 to ~0 across ~300 ticks.
@@ -313,12 +369,12 @@
     scale = Math.max(0.2, Math.min(3, scale * factor));
   }
 
-  // Rebuild on vault changes / filter changes
+  // Rebuild on vault / filter / mode / visibility changes
   $effect(() => {
-    // depend on these
     void vault.notes;
     void filter;
-    void showOrphans;
+    void hideNeighbors;
+    void visibleIds;
     buildGraph();
   });
 
@@ -328,6 +384,8 @@
     reheat();
   });
 
+  let unregisterDrop: (() => void) | null = null;
+
   onMount(() => {
     if (!canvas) return;
     ctx = canvas.getContext('2d');
@@ -335,21 +393,46 @@
     window.addEventListener('resize', resize);
     buildGraph();
     raf = requestAnimationFrame(tick);
+
+    unregisterDrop = dragNote.registerDropHandler((noteId, x, y) => {
+      if (!canvas) return false;
+      const rect = canvas.getBoundingClientRect();
+      if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return false;
+      addToGraph(noteId, x, y);
+      return true;
+    });
   });
 
   onDestroy(() => {
     cancelAnimationFrame(raf);
     window.removeEventListener('resize', resize);
+    unregisterDrop?.();
+  });
+
+  /* Show the dashed highlight while a note drag is hovering this canvas. */
+  const dragOver = $derived.by(() => {
+    if (!dragNote.active || !canvas) return false;
+    const rect = canvas.getBoundingClientRect();
+    return (
+      dragNote.x >= rect.left &&
+      dragNote.x <= rect.right &&
+      dragNote.y >= rect.top &&
+      dragNote.y <= rect.bottom
+    );
   });
 </script>
 
-<div class="relative h-full w-full bg-background">
+<div
+  class="relative h-full w-full bg-background"
+  role="region"
+  aria-label="Graph canvas"
+>
   <div class="absolute left-3 top-3 z-10 flex w-72 flex-col gap-2 rounded-lg border border-border bg-popover/90 p-3 shadow-lg backdrop-blur">
-    <div class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Graph</div>
+    <div class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Local graph</div>
     <Input bind:value={filter} placeholder="Filter notes…" />
     <label class="flex cursor-pointer items-center gap-2 text-xs">
-      <input type="checkbox" bind:checked={showOrphans} />
-      Show orphan notes
+      <input type="checkbox" bind:checked={hideNeighbors} />
+      Hide neighbor notes
     </label>
     <div class="flex items-center gap-1.5">
       <Button variant="outline" size="sm" onclick={() => { scale = 1; panX = 0; panY = 0; reheat(); }}>
@@ -358,7 +441,7 @@
       <span class="text-[10px] text-muted-foreground">{nodes.length} nodes · {edges.length} edges</span>
     </div>
     <p class="text-[10px] leading-snug text-muted-foreground">
-      Click a node to open · drag a node to move it · drag empty space to pan · scroll to zoom
+      Drag a file from the left panel onto the canvas · click a node to open · drag a node to move it · scroll to zoom
     </p>
   </div>
 
@@ -372,6 +455,29 @@
     onmouseleave={onMouseUp}
     onwheel={onWheel}
   ></canvas>
+
+  {#if dragOver}
+    <div class="pointer-events-none absolute inset-0 z-20 border-2 border-dashed border-primary/60 bg-primary/5"></div>
+  {/if}
+
+  {#if visibleIds.size === 0}
+    <div class="pointer-events-none absolute inset-0 grid place-items-center">
+      <div class="text-center text-muted-foreground">
+        <div class="mx-auto mb-3 grid h-14 w-14 place-items-center rounded-full border border-dashed border-border opacity-70">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="h-6 w-6">
+            <circle cx="6" cy="6" r="2.5" />
+            <circle cx="18" cy="7" r="2.5" />
+            <circle cx="12" cy="18" r="2.5" />
+            <line x1="8" y1="7" x2="15.5" y2="7.5" />
+            <line x1="7" y1="8" x2="11" y2="15.5" />
+            <line x1="17" y1="9" x2="13" y2="15.5" />
+          </svg>
+        </div>
+        <p class="text-sm font-medium">Empty graph</p>
+        <p class="mt-1 text-xs">Drag a note from the left sidebar onto this canvas to start exploring.</p>
+      </div>
+    </div>
+  {/if}
 
   <!-- Bottom edit bar -->
   <div
@@ -438,6 +544,14 @@
         onclick={() => { spreadMul = 1; nodeSizeMul = 1; linkWidth = 1; }}
       >
         Reset
+      </button>
+      <button
+        type="button"
+        class="shrink-0 rounded-md border border-border px-2.5 py-1 text-[11px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive disabled:opacity-40"
+        disabled={visibleIds.size === 0}
+        onclick={clearGraph}
+      >
+        Clear graph
       </button>
     </div>
   </div>

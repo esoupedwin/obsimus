@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { vault, tabs, ui, commands } from '$lib/state.svelte';
+  import { vault, tabs, ui, commands, dragNote } from '$lib/state.svelte';
   import TitleBar from '$lib/components/app/TitleBar.svelte';
   import LeftSidebar from '$lib/components/app/LeftSidebar.svelte';
   import RightSidebar from '$lib/components/app/RightSidebar.svelte';
@@ -150,3 +150,13 @@
 
 <CommandPalette />
 <QuickSwitcher />
+
+{#if dragNote.active}
+  <div
+    class="pointer-events-none fixed z-[100] flex items-center gap-1.5 rounded-md border border-border bg-popover/95 px-2.5 py-1 text-xs shadow-lg backdrop-blur"
+    style="left: {dragNote.x + 12}px; top: {dragNote.y + 12}px"
+  >
+    <span class="text-muted-foreground">📎</span>
+    <span class="max-w-[260px] truncate font-medium">{dragNote.label}</span>
+  </div>
+{/if}

@@ -489,3 +489,63 @@ class CommandStore {
 }
 
 export const commands = new CommandStore();
+
+/* ---------------------- Note drag (pointer-based) ------------------------ */
+
+type DropHandler = (noteId: NoteId, x: number, y: number) => boolean;
+
+class DragNoteStore {
+  noteId = $state<NoteId | null>(null);
+  label = $state('');
+  active = $state(false);
+  x = $state(0);
+  y = $state(0);
+  private startX = 0;
+  private startY = 0;
+  private handlers = new Set<DropHandler>();
+
+  begin(noteId: NoteId, label: string, x: number, y: number) {
+    this.noteId = noteId;
+    this.label = label;
+    this.startX = x;
+    this.startY = y;
+    this.x = x;
+    this.y = y;
+    this.active = false;
+  }
+
+  move(x: number, y: number) {
+    this.x = x;
+    this.y = y;
+    if (!this.active && this.noteId) {
+      if (Math.hypot(x - this.startX, y - this.startY) > 5) this.active = true;
+    }
+  }
+
+  /** Returns true if a real drag occurred (so the caller can suppress click). */
+  end(x: number, y: number): boolean {
+    const wasActive = this.active;
+    if (wasActive && this.noteId) {
+      for (const h of this.handlers) {
+        if (h(this.noteId, x, y)) break;
+      }
+    }
+    this.noteId = null;
+    this.label = '';
+    this.active = false;
+    return wasActive;
+  }
+
+  cancel() {
+    this.noteId = null;
+    this.label = '';
+    this.active = false;
+  }
+
+  registerDropHandler(handler: DropHandler) {
+    this.handlers.add(handler);
+    return () => this.handlers.delete(handler);
+  }
+}
+
+export const dragNote = new DragNoteStore();

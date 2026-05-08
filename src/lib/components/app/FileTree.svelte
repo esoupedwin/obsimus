@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { vault, tabs } from '$lib/state.svelte';
+  import { vault, tabs, dragNote } from '$lib/state.svelte';
   import type { TreeNode, FolderNode, FileNode } from '$lib/types';
   import { ChevronRight, ChevronDown, FileText, Folder, FolderOpen, Plus, FolderPlus, RefreshCw } from 'lucide-svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -10,6 +10,46 @@
   let menuOpenFor = $state<string | null>(null);
   let renaming = $state<string | null>(null);
   let renameValue = $state('');
+  let suppressNextClick = false;
+
+  function beginPointerDrag(e: PointerEvent, file: FileNode) {
+    if (renaming === file.path) return;
+    if (e.button !== 0) return;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let started = false;
+
+    function move(ev: PointerEvent) {
+      if (!started) {
+        if (Math.hypot(ev.clientX - startX, ev.clientY - startY) <= 5) return;
+        dragNote.begin(file.path, file.name, ev.clientX, ev.clientY);
+        started = true;
+      }
+      dragNote.move(ev.clientX, ev.clientY);
+    }
+    function end(ev: PointerEvent) {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', cancel);
+      if (started) {
+        const wasDrag = dragNote.end(ev.clientX, ev.clientY);
+        if (wasDrag) {
+          suppressNextClick = true;
+          setTimeout(() => { suppressNextClick = false; }, 50);
+        }
+      }
+    }
+    function cancel() {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', end);
+      window.removeEventListener('pointercancel', cancel);
+      dragNote.cancel();
+    }
+
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', cancel);
+  }
 
   function toggle(path: string) {
     if (expanded.has(path)) expanded.delete(path);
@@ -142,13 +182,14 @@
     {@const file = node as FileNode}
     {@const isActive = tabs.active?.noteId === file.path}
     <div
-      class={'group flex cursor-pointer select-none items-center gap-1 rounded-sm pr-1 ' +
+      class={'group flex cursor-grab select-none items-center gap-1 rounded-sm pr-1 active:cursor-grabbing ' +
         (isActive ? 'bg-sidebar-accent text-foreground' : 'hover:bg-sidebar-accent/60')}
-      style="padding-left: {depth * 12 + 22}px"
+      style="padding-left: {depth * 12 + 22}px; touch-action: none"
       role="button"
       tabindex="0"
+      onpointerdown={(e) => beginPointerDrag(e, file)}
       ondblclick={() => startRename(file.path, file.name)}
-      onclick={() => tabs.open(file.path)}
+      onclick={() => { if (suppressNextClick) return; tabs.open(file.path); }}
       onkeydown={(e) => { if (e.key === 'Enter') tabs.open(file.path); if (e.key === 'F2') startRename(file.path, file.name); }}
     >
       <FileText class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
